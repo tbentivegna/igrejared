@@ -1,0 +1,16 @@
+{
+  "rewrites": [
+    {
+      "source": "/api-church/:path*",
+      "destination": "https://sistema.igrejared.com/api-church/:path*"
+    },
+    {
+      "source": "/api-person/:path*",
+      "destination": "https://sistema.igrejared.com/api-person/:path*"
+    },
+    {
+      "source": "/api-authorization/:path*",
+      "destination": "https://sistema.igrejared.com/api-authorization/:path*"
+    }
+  ]
+}
