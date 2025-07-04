@@ -1,0 +1,403 @@
+// src/components/GroupList.jsx
+
+import React, { useEffect, useState } from 'react'
+import { DragDropContext } from 'react-beautiful-dnd'
+import { churchApi } from '../features/api'
+import { authorizationApi } from '../features/api'
+import GroupCard from './GroupCard'
+
+// paleta de cores para casais
+const coupleColorClasses = [
+  { border: 'border-pink-500',   ring: 'ring-pink-300'   },
+  { border: 'border-blue-500',   ring: 'ring-blue-300'   },
+  { border: 'border-green-500',  ring: 'ring-green-300'  },
+  { border: 'border-yellow-500', ring: 'ring-yellow-300' },
+  { border: 'border-purple-500', ring: 'ring-purple-300' },
+  { border: 'border-red-500',    ring: 'ring-red-300'    },
+  { border: 'border-teal-500',   ring: 'ring-teal-300'   },
+  { border: 'border-indigo-500', ring: 'ring-indigo-300' }
+]
+
+export default function GroupList() {
+  const [groups, setGroups] = useState([])
+  const [membersByGroup, setMembersByGroup] = useState({})
+  const [collapsedMap, setCollapsedMap] = useState({})
+
+  const [allStatuses, setAllStatuses] = useState([])
+  const [selectedStatuses, setSelectedStatuses] = useState([])
+  const [showStatusDropdown, setShowStatusDropdown] = useState(false)
+
+  const [searchTerm, setSearchTerm] = useState('')
+  const [filteredGroups, setFilteredGroups] = useState([])
+
+  // log de alterações
+  const [actionLog, setActionLog] = useState([])
+  const [showChangeFrame, setShowChangeFrame] = useState(false)
+
+  // 1) Fetch e prepara dados
+  useEffect(() => {
+    async function fetchData() {
+      try {
+        const { data: groupList } = await churchApi.get(
+          `/groups/ministries/${import.meta.env.VITE_MINISTRY_ID}`,
+          { params: { hierarchy: true } }
+        )
+
+        // status filter
+        const statuses = Array.from(new Set(groupList.map(g => g.status)))
+        setAllStatuses(statuses)
+        setSelectedStatuses(statuses)
+        setGroups(groupList)
+
+        // monta membersByGroup
+        const map = {}
+        groupList.forEach(grp => {
+          const list = grp.groupPersonResponseList || []
+          map[grp.id] = list.map(gpr => {
+            const { person, role } = gpr
+            const ep = person.extraProperties || {}
+
+            // filhos que vão participar
+            const totalKids = Number(ep.numberOfChildren) || 0
+            let joiningKids = 0
+            for (let i = 1; i <= totalKids; i++) {
+              if (ep[`child${i}WillJoin`]?.trim().toLowerCase() === 'sim') {
+                joiningKids++
+              }
+            }
+
+            return {
+              id: person.id,
+              fullName: person.fullName,
+              role,
+              dayOfWeek: ep.dayOfWeek,
+              civilStatus: person.civilStatus,
+              hostAvailability: ep.hostAvailability || '',
+              spouseName: ep.spouseName || '',
+              numberOfChildren: totalKids,
+              participatingChildrenCount: joiningKids,
+              smallGroupPriority: ep.smallGroupPriority || 0
+            }
+          })
+        })
+
+        // detecta casais + cores + spouseId
+        Object.values(map).forEach(members => {
+          let colorIndex = 0
+          const coupleMap = {}
+          members.forEach(m => {
+            if (!m.spouseName) return
+            const target = m.spouseName.trim().toLowerCase()
+            const partner = members.find(
+              x => x.fullName.trim().toLowerCase() === target
+            )
+            if (!partner) return
+
+            const key = [m.fullName, partner.fullName]
+              .map(n => n.trim().toLowerCase())
+              .sort()
+              .join('||')
+            if (!coupleMap[key]) {
+              coupleMap[key] =
+                coupleColorClasses[
+                  colorIndex++ % coupleColorClasses.length
+                ]
+            }
+            const { border, ring } = coupleMap[key]
+            m.isCouple = true
+            m.spouseId = partner.id
+            m.coupleBorderClass = border
+            m.coupleRingClass = ring
+
+            partner.isCouple = true
+            partner.spouseId = m.id
+            partner.coupleBorderClass = border
+            partner.coupleRingClass = ring
+          })
+        })
+
+        // ordena membros (casais juntos; líderes→hosts→outros)
+        Object.entries(map).forEach(([groupId, members]) => {
+          const processed = new Set()
+          const units = []
+
+          // casais
+          members.forEach(m => {
+            if (m.isCouple && !processed.has(m.id)) {
+              const p = members.find(x => x.id === m.spouseId)
+              if (p) {
+                units.push([m, p])
+                processed.add(m.id)
+                processed.add(p.id)
+              }
+            }
+          })
+          // solteiros
+          members.forEach(m => {
+            if (!processed.has(m.id)) {
+              units.push([m])
+              processed.add(m.id)
+            }
+          })
+          // peso
+          const weight = u => {
+            if (u.some(x => /líder|leader/i.test(x.role))) return 1
+            if (u.some(x => x.hostAvailability.toLowerCase() === 'sim'))
+              return 2
+            return 3
+          }
+          // sort
+          units.sort((a, b) => {
+            const wa = weight(a), wb = weight(b)
+            if (wa !== wb) return wa - wb
+            return a[0].fullName.localeCompare(b[0].fullName, {
+              sensitivity: 'base'
+            })
+          })
+          map[groupId] = units.flat()
+        })
+
+        setMembersByGroup(map)
+      } catch (err) {
+        console.error('Erro ao buscar grupos:', err)
+      }
+    }
+    fetchData()
+  }, [])
+
+  // 2) init collapse
+  useEffect(() => {
+    const init = {}
+    groups.forEach(g => (init[g.id] = true))
+    setCollapsedMap(init)
+  }, [groups])
+
+  // 3) filtra por status + busca
+  useEffect(() => {
+    const term = searchTerm.trim().toLowerCase()
+    const filtered = groups.filter(g => {
+      if (!selectedStatuses.includes(g.status)) return false
+      if (!term) return true
+      if (g.name.toLowerCase().includes(term)) return true
+      const members = membersByGroup[g.id] || []
+      return members.some(m =>
+        m.fullName.toLowerCase().includes(term)
+      )
+    })
+    setFilteredGroups(filtered)
+  }, [groups, membersByGroup, selectedStatuses, searchTerm])
+
+  // 4) onDragEnd com logging de nomes
+  function onDragEnd(result) {
+    const { source, destination } = result
+    if (!destination) return
+
+    const srcId = source.droppableId
+    const dstId = destination.droppableId
+    const srcItems = Array.from(membersByGroup[srcId] || [])
+    const dstItems = Array.from(membersByGroup[dstId] || [])
+
+    let moved
+    if (srcId === dstId) {
+      // só reordena
+      ;[moved] = srcItems.splice(source.index, 1)
+      srcItems.splice(destination.index, 0, moved)
+      setMembersByGroup(prev => ({ ...prev, [srcId]: srcItems }))
+      return
+    }
+
+    // cross‐group
+    ;[moved] = srcItems.splice(source.index, 1)
+    dstItems.splice(destination.index, 0, moved)
+    setMembersByGroup(prev => ({
+      ...prev,
+      [srcId]: srcItems,
+      [dstId]: dstItems
+    }))
+
+    const fromGroup = groups.find(g => String(g.id) === srcId)
+    const toGroup   = groups.find(g => String(g.id) === dstId)
+    const today     = new Date().toISOString().split('T')[0]
+
+    setActionLog(prev => [
+      ...prev,
+      {
+        type: 'remove',
+        groupId: Number(srcId),
+        personId: moved.id,
+        memberName: moved.fullName,
+        groupName: fromGroup?.name || ''
+      },
+      {
+        type: 'add',
+        groupId: Number(dstId),
+        personId: moved.id,
+        memberName: moved.fullName,
+        groupName: toGroup?.name || '',
+        role: moved.role,
+        status: toGroup?.status || '',
+        startDate: today
+      }
+    ])
+  }
+
+  function collapseAll() {
+    const m = {}
+    filteredGroups.forEach(g => (m[g.id] = true))
+    setCollapsedMap(m)
+  }
+  function expandAll() {
+    const m = {}
+    filteredGroups.forEach(g => (m[g.id] = false))
+    setCollapsedMap(m)
+  }
+  function toggleCollapse(id) {
+    setCollapsedMap(prev => ({ ...prev, [id]: !prev[id] }))
+  }
+
+  // 5) submete cada ação via DELETE/POST
+  async function submitChanges() {
+  if (!actionLog.length) return
+
+  try {
+    for (const a of actionLog) {
+      if (a.type === 'add') {
+        console.log("POST para:", `/groups/${a.groupId}/people/${a.personId}`)
+        await authorizationApi.post(
+          `/groups/${a.groupId}/people/${a.personId}`,
+          {
+            role:      a.role.toUpperCase(),
+            status:    a.status.toUpperCase(),
+            startDate: a.startDate
+          }
+        )
+      } else if (a.type === 'remove') {
+        console.log("DELETE para:", `/groups/${a.groupId}/people/${a.personId}`)
+        await authorizationApi.delete(
+          `/groups/${a.groupId}/people/${a.personId}`
+        )
+      }
+    }
+
+    alert('Mudanças salvas com sucesso!')
+    setActionLog([])
+    setShowChangeFrame(false)
+  } catch (err) {
+    console.error('Erro ao salvar mudanças:', err)
+    const status = err.response?.status
+    const data   = err.response?.data
+    console.log("Headers:", authorizationApi.defaults.headers)
+    alert(`Falha (${status}): ${data?.message || err.message}`)
+  }
+}
+
+
+  return (
+    <DragDropContext onDragEnd={onDragEnd}>
+      {/* controles */}
+      <div className="flex flex-wrap gap-4 items-center mb-4">
+        <button onClick={collapseAll} className="px-3 py-1 bg-gray-200 rounded hover:bg-gray-300">
+          Colapsar Todos
+        </button>
+        <button onClick={expandAll} className="px-3 py-1 bg-gray-200 rounded hover:bg-gray-300">
+          Expandir Todos
+        </button>
+        <input
+          type="text"
+          placeholder="Buscar grupo ou pessoa..."
+          value={searchTerm}
+          onChange={e => setSearchTerm(e.target.value)}
+          className="border px-2 py-1 rounded text-sm flex-1 min-w-[200px]"
+        />
+        <div className="relative">
+          <button
+            onClick={() => setShowStatusDropdown(v => !v)}
+            className="px-3 py-1 bg-gray-200 rounded hover:bg-gray-300 flex items-center space-x-1"
+          >
+            <span>Status</span>
+            <span className="text-xs">{showStatusDropdown ? '▴' : '▾'}</span>
+          </button>
+          {showStatusDropdown && (
+            <div className="absolute right-0 mt-2 w-48 bg-white border rounded shadow-lg p-2 max-h-60 overflow-y-auto z-20">
+              {allStatuses.map(status => (
+                <label key={status} className="flex items-center space-x-2 px-2 py-1 hover:bg-gray-100 rounded">
+                  <input
+                    type="checkbox"
+                    checked={selectedStatuses.includes(status)}
+                    onChange={() =>
+                      setSelectedStatuses(prev =>
+                        prev.includes(status)
+                          ? prev.filter(s => s !== status)
+                          : [...prev, status]
+                      )
+                    }
+                    className="form-checkbox h-4 w-4 text-blue-600"
+                  />
+                  <span className="text-sm">{status}</span>
+                </label>
+              ))}
+            </div>
+          )}
+        </div>
+        <button
+          onClick={() => setShowChangeFrame(true)}
+          disabled={!actionLog.length}
+          className="ml-auto px-3 py-1 bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50"
+        >
+          Salvar Mudanças
+        </button>
+      </div>
+
+      {/* modal de revisão */}
+      {showChangeFrame && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <div className="bg-white rounded shadow-lg w-96 max-h-[80vh] overflow-y-auto p-6">
+            <h3 className="text-lg font-bold mb-4">Revisar Mudanças</h3>
+            <ul className="list-disc list-inside space-y-1">
+              {actionLog.map((a, i) => (
+                <li key={i}>
+                  {a.type === 'remove'
+                    ? `Retirada: ${a.memberName} do grupo ${a.groupName}`
+                    : `Inclusão: ${a.memberName} ➔ grupo ${a.groupName} (role=${a.role}, status=${a.status})`}
+                </li>
+              ))}
+            </ul>
+            <div className="mt-6 flex justify-end space-x-2">
+              <button
+                onClick={() => setShowChangeFrame(false)}
+                className="px-3 py-1 bg-gray-200 rounded hover:bg-gray-300"
+              >
+                Voltar
+              </button>
+              <button
+                onClick={submitChanges}
+                className="px-3 py-1 bg-blue-600 text-white rounded hover:bg-blue-700"
+              >
+                Confirmar Mudanças
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* contagem de grupos */}
+      <div className="w-full text-right mb-2 text-sm text-gray-600">
+        {filteredGroups.length} grupo
+        {filteredGroups.length !== 1 && 's'} encontrado
+      </div>
+
+      {/* grid de GroupCards */}
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+        {filteredGroups.map(group => (
+          <GroupCard
+            key={group.id}
+            group={group}
+            members={membersByGroup[group.id] || []}
+            collapsed={collapsedMap[group.id]}
+            onToggle={() => toggleCollapse(group.id)}
+          />
+        ))}
+      </div>
+    </DragDropContext>
+  )
+}
